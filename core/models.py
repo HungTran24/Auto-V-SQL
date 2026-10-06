@@ -49,5 +49,6 @@ class ExperimentRecord:
     question: str
     gold_sql: str
     baseline: MethodRunOutput
-    vsql_paper: MethodRunOutput
+    vsql_paper: Optional[MethodRunOutput]  # None khi DB không có View viết tay
     autovsql: MethodRunOutput
+    db_id: str = "superhero"

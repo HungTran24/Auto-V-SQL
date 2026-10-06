@@ -1,12 +1,14 @@
 import sqlite3
+import time
 from typing import Dict, Tuple, Any, Optional
 from core.models import TableMetadata, ForeignKeyInfo
 from core.ports import DatabasePort
 
 class SqliteDatabaseAdapter(DatabasePort):
     """Adapter thao tác với SQLite Database Engine"""
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, query_timeout_seconds: float = 60):
         self.db_path = db_path
+        self.query_timeout_seconds = query_timeout_seconds
 
     def get_all_tables_metadata(self) -> Dict[str, TableMetadata]:
         conn = sqlite3.connect(self.db_path)
@@ -47,6 +49,9 @@ class SqliteDatabaseAdapter(DatabasePort):
     def execute_query(self, sql: str) -> Tuple[bool, Optional[Tuple[Any, ...]], str]:
         """Thực thi câu SQL, trả về (thành công, dữ liệu dòng, thông báo lỗi)"""
         conn = sqlite3.connect(self.db_path)
+        # Ngắt query chạy quá lâu (vd. cartesian JOIN do LLM sinh) để thực nghiệm không treo
+        deadline = time.monotonic() + self.query_timeout_seconds
+        conn.set_progress_handler(lambda: time.monotonic() > deadline, 10000)
         cur = conn.cursor()
         try:
             cur.execute(sql)

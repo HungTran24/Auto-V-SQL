@@ -1,7 +1,11 @@
 import os
 import sys
 import json
-from typing import List
+import argparse
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
+from typing import List, Optional
 
 # Đảm bảo import đúng cấu trúc Clean Architecture
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -79,115 +83,104 @@ def load_bird_test_cases(dataset_json_path: str, db_id: str = "superhero", sampl
         ))
     return test_cases
 
+BATCH_SIZE = 20
+MODEL = "gemini-3.5-flash-lite"
+ENDPOINT = "http://localhost:8317/v1/chat/completions"
+
+
+def stage1_schema(auto_views: dict, meta: dict) -> str:
+    """D' = các View tự sinh + DDL gốc của bảng chưa có View (DB không sinh được View thì dùng nguyên D)."""
+    uncovered = [t.create_sql for name, t in meta.items() if f"v_{name}" not in auto_views]
+    return "\n\n".join(list(auto_views.values()) + uncovered)
+
+
+def build_context(base_dir: str, db_id: str) -> dict:
+    db = SqliteDatabaseAdapter(os.path.join(base_dir, "data", "bird_databases", db_id, f"{db_id}.sqlite"))
+    llm = CPALlmAdapter(endpoint_url=ENDPOINT, model_name=MODEL, temperature=0.0, max_attempts=3)
+    engine = VSQLExperimentEngine(llm=llm, evaluator=QueryEvaluatorService(db=db))
+    meta = db.get_all_tables_metadata()
+    auto_views = SchemaGraphAutoViewService().generate_views(meta)
+    return {
+        "engine": engine,
+        "raw_ddl": db.get_full_schema_ddl(),
+        "auto_ddl": stage1_schema(auto_views, meta),
+        "paper_ddl": get_paper_views_ddl() if db_id == "superhero" else None,  # View viết tay chỉ có cho superhero
+        "n_views": len(auto_views),
+    }
+
+
+def run_case(ctx: dict, db_id: str, tc: TestCase) -> dict:
+    e = ctx["engine"]
+    base = e.run_baseline_direct(tc.question, ctx["raw_ddl"], tc.gold_sql, tc.evidence)
+    paper = (e.run_two_stage_view_sql(tc.question, ctx["raw_ddl"], ctx["paper_ddl"], tc.gold_sql, tc.evidence)
+             if ctx["paper_ddl"] else None)
+    auto = e.run_two_stage_view_sql(tc.question, ctx["raw_ddl"], ctx["auto_ddl"], tc.gold_sql, tc.evidence)
+    rec = asdict(ExperimentRecord(tc.id, tc.difficulty, tc.question, tc.gold_sql, base, paper, auto, db_id))
+    for key in ("baseline", "vsql_paper", "autovsql"):  # rows + DDL lặp lại làm file phình hàng trăm nghìn dòng
+        if rec[key]:
+            rec[key]["execution"]["rows"] = None
+            rec[key]["views_used"] = None
+    return rec
+
+
+def summarize(records: List[dict]) -> None:
+    def ex(rows, key):
+        rows = [r for r in rows if r[key]]
+        return (f"{sum(r[key]['execution']['is_correct'] for r in rows) / len(rows) * 100:6.2f}% "
+                f"({sum(r[key]['execution']['is_correct'] for r in rows)}/{len(rows)})") if rows else "   n/a"
+    groups = defaultdict(list)
+    for r in records:
+        groups["TOTAL"].append(r); groups[r["db_id"]].append(r); groups["~" + r["difficulty"]].append(r)
+    print(f"\n{'Nhóm':28}{'Direct':>18}{'V-SQL paper':>18}{'Auto-V-SQL':>18}")
+    for g in sorted(groups, key=lambda k: (k != "TOTAL", k.startswith("~"), k)):
+        rows = groups[g]
+        print(f"{g:28}{ex(rows,'baseline'):>18}{ex(rows,'vsql_paper'):>18}{ex(rows,'autovsql'):>18}")
+
+
 def main():
-    print("=" * 75)
-    print("    HỆ THỐNG THỰC NGHIỆM ĐỐI CHỨNG TEXT-TO-SQL TRÊN BIRD BENCHMARK GỐC    ")
-    print("    Kiến trúc: Ports & Adapters + DI + OOP/FP (Clean Architecture)       ")
-    print("    Mô hình: gemini-3.5-flash-lite via CPA Proxy (localhost:8317)       ")
-    print("=" * 75)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--limit-per-db", type=int, default=None, help="Chạy thử: chỉ lấy N câu mỗi DB")
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--output", default="experiment_results_full.json")
+    args = ap.parse_args()
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    db_file = os.path.join(base_dir, "data", "bird_databases", "superhero", "superhero.sqlite")
-    dataset_json = os.path.join(base_dir, "data", "bird_mini_dev_sqlite.json")
-    artifacts_dir = os.path.join(base_dir, "artifacts")
+    with open(os.path.join(base_dir, "data", "bird_mini_dev_sqlite.json"), encoding="utf-8") as f:
+        raw = json.load(f)
+    db_ids = sorted({d["db_id"] for d in raw})
+    reporter = JsonReporterAdapter(output_dir=os.path.join(base_dir, "artifacts"))
+    out_path = os.path.join(base_dir, "artifacts", args.output)
 
-    if not os.path.exists(db_file):
-        print(f"[!] Lỗi: Không tìm thấy database tại {db_file}")
-        return
+    records: List[dict] = json.load(open(out_path, encoding="utf-8")) if os.path.exists(out_path) else []
+    done = {(r["db_id"], r["test_id"]) for r in records}
+    print(f"Model: {MODEL} | {len(db_ids)} DB | đã có {len(records)} bản ghi (resume) | workers={args.workers}")
 
-    # 1. Dependency Injection: Khởi tạo Adapters & Services
-    print("\n[1/4] Khởi tạo Adapters và Services (Dependency Injection)...")
-    db_adapter = SqliteDatabaseAdapter(db_file)
-    llm_adapter = CPALlmAdapter(
-        endpoint_url="http://localhost:8317/v1/chat/completions",
-        model_name="gemini-3.5-flash-lite",
-        temperature=0.0
-    )
-    evaluator_service = QueryEvaluatorService(db=db_adapter)
-    auto_view_service = SchemaGraphAutoViewService()
-    reporter_adapter = JsonReporterAdapter(output_dir=artifacts_dir)
-    vsql_engine = VSQLExperimentEngine(llm=llm_adapter, evaluator=evaluator_service)
+    tasks = []
+    contexts = {}
+    for db_id in db_ids:
+        contexts[db_id] = build_context(base_dir, db_id)
+        cases = load_bird_test_cases(os.path.join(base_dir, "data", "bird_mini_dev_sqlite.json"), db_id=db_id)
+        if args.limit_per_db:
+            cases = cases[:args.limit_per_db]
+        print(f"  {db_id:26} {len(cases):3} câu | auto-view: {contexts[db_id]['n_views']} view")
+        tasks += [(db_id, tc) for tc in cases if (db_id, tc.id) not in done]
+    print(f"Còn {len(tasks)} câu cần chạy.\n")
 
-    # 2. Phân tích Schema và Tạo Views tự động
-    print("[2/4] Quét cấu trúc khóa ngoại và tự động tạo Views (Auto-View Generator)...")
-    schema_meta = db_adapter.get_all_tables_metadata()
-    raw_ddl = db_adapter.get_full_schema_ddl()
-    
-    auto_views_dict = auto_view_service.generate_views(schema_meta)
-    auto_views_ddl = "\n\n".join(auto_views_dict.values())
-    paper_views_ddl = get_paper_views_ddl()
-    print(f"      -> Tự động sinh thành công {len(auto_views_dict)} views từ schema gốc.")
+    since_save = 0
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        for i, rec in enumerate(pool.map(lambda t: run_case(contexts[t[0]], *t), tasks), 1):
+            records.append(rec)
+            since_save += 1
+            mark = lambda m: "-" if m is None else ("OK" if m["execution"]["is_correct"] else "X")
+            print(f"[{i}/{len(tasks)}] {rec['db_id']}#{rec['test_id']} {rec['difficulty']:11} "
+                  f"direct={mark(rec['baseline'])} paper={mark(rec['vsql_paper'])} auto={mark(rec['autovsql'])}", flush=True)
+            if since_save >= BATCH_SIZE:
+                reporter.save_raw(records, args.output)
+                since_save = 0
+    reporter.save_raw(records, args.output)
+    print(f"\n[OK] Đã lưu {len(records)} bản ghi -> {out_path}")
+    summarize(records)
 
-    # 3. Nạp tập Test Cases từ BIRD Benchmark (Full 52 câu)
-    test_cases = load_bird_test_cases(dataset_json, db_id="superhero", sample_limit=None)
-    print(f"[3/4] Đã nạp toản bộ {len(test_cases)} câu hỏi chính thức của BIRD Mini-Dev (SuperHero DB).")
-    print("      Phân bố: " + ", ".join([f"{diff}: {sum(1 for t in test_cases if t.difficulty.lower() == diff.lower())}" for diff in ["Simple", "Moderate", "Challenging"]]))
-
-    # 4. Thực thi thực nghiệm đối chứng
-    print(f"\n[4/4] Bắt đầu chạy thực nghiệm đối chứng trên FULL {len(test_cases)} câu...")
-    records: List[ExperimentRecord] = []
-
-    for idx, tc in enumerate(test_cases, 1):
-        print(f"\n--- [Case {idx}/{len(test_cases)} | ID:{tc.id}] [{tc.difficulty}] ---")
-        print(f"  Q: {tc.question}")
-        if tc.evidence:
-            print(f"  E: {tc.evidence[:60]}...")
-
-        # Config 1: Baseline Direct
-        base_out = vsql_engine.run_baseline_direct(tc.question, raw_ddl, tc.gold_sql, tc.evidence)
-        base_status = "ĐÚNG" if base_out.execution.is_correct else "SAI"
-        print(f"  [1] Baseline Direct : [{base_status}] {base_out.execution.error_message}")
-
-        # Config 2: V-SQL Replicated (Paper manual views)
-        vsql_out = vsql_engine.run_two_stage_view_sql(tc.question, raw_ddl, paper_views_ddl, tc.gold_sql, tc.evidence)
-        vsql_status = "ĐÚNG" if vsql_out.execution.is_correct else "SAI"
-        print(f"  [2] V-SQL (Paper)   : [{vsql_status}] {vsql_out.execution.error_message}")
-
-        # Config 3: Auto-V-SQL (Our Proposed Auto-Views)
-        autovsql_out = vsql_engine.run_two_stage_view_sql(tc.question, raw_ddl, auto_views_ddl, tc.gold_sql, tc.evidence)
-        autovsql_status = "ĐÚNG" if autovsql_out.execution.is_correct else "SAI"
-        print(f"  [3] Auto-V-SQL (Ours): [{autovsql_status}] {autovsql_out.execution.error_message}")
-
-        records.append(ExperimentRecord(
-            test_id=tc.id,
-            difficulty=tc.difficulty,
-            question=tc.question,
-            gold_sql=tc.gold_sql,
-            baseline=base_out,
-            vsql_paper=vsql_out,
-            autovsql=autovsql_out
-        ))
-
-    # Lưu Artifacts ra JSON
-    saved_path = reporter_adapter.save_records(records, "experiment_results.json")
-    print(f"\n[OK] Toàn bộ kết quả chi tiết đã được lưu tại: {saved_path}")
-
-    # Tự động cập nhật vào visualize.html
-    html_file = os.path.join(base_dir, "visualize.html")
-    if os.path.exists(html_file):
-        with open(saved_path, "r", encoding="utf-8") as f:
-            json_text = f.read()
-        with open(html_file, "r", encoding="utf-8") as f:
-            html = f.read()
-        import re
-        html = re.sub(r"let experimentData = \[.*?\];", f"let experimentData = {json_text};", html, flags=re.DOTALL)
-        with open(html_file, "w", encoding="utf-8") as f:
-            f.write(html)
-        print(f"[OK] Đã cập nhật kết quả full vào Dashboard: {html_file}")
-
-    # Báo cáo thống kê
-    total = len(records)
-    base_acc = sum(1 for r in records if r.baseline.execution.is_correct) / total * 100
-    vsql_acc = sum(1 for r in records if r.vsql_paper.execution.is_correct) / total * 100
-    autovsql_acc = sum(1 for r in records if r.autovsql.execution.is_correct) / total * 100
-
-    print("\n" + "=" * 75)
-    print("                     BẢNG TỔNG HỢP KẾT QUẢ CUỐI CÙNG                   ")
-    print("=" * 75)
-    print(f"  * Baseline Direct (1-Stage)     : {base_acc:6.2f}% ({sum(1 for r in records if r.baseline.execution.is_correct)}/{total})")
-    print(f"  * V-SQL Paper Replicate (Manual): {vsql_acc:6.2f}% ({sum(1 for r in records if r.vsql_paper.execution.is_correct)}/{total})")
-    print(f"  * Auto-V-SQL (Our Contribution) : {autovsql_acc:6.2f}% ({sum(1 for r in records if r.autovsql.execution.is_correct)}/{total})")
-    print("=" * 75)
 
 if __name__ == "__main__":
     main()
